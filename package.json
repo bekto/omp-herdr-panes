@@ -1,0 +1,21 @@
+{
+	"name": "omp-herdr-panes",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Oh My Pi extension: show each omp subagent in its own stacked Herdr pane",
+	"license": "MIT",
+	"omp": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "BUN_BE_BUN=1 omp test"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.2",
+		"typescript": "^7.0.2"
+	}
+}
