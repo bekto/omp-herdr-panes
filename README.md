@@ -8,16 +8,9 @@ at the end, a result. This extension gives every subagent a **read-only pane** n
 pane that streams its task, thinking, tool calls, and results as they happen. A pane closes by
 itself a few seconds after its subagent finishes, and your omp pane goes back to full width.
 
-```
-┌──────────────────────┬──────────────┐
-│                      │ ProbeA·sonic │
-│   omp (you type      ├──────────────┤
-│   here, as usual)    │ ProbeB·sonic │
-│                      ├──────────────┤
-│                      │ Scout·scout  │
-└──────────────────────┴──────────────┘
-```
+![omp in the left pane with two subagents, T009Templates and T011Assets, streaming live in stacked panes on the right](docs/screenshot.png)
 
+*omp on the left; two running subagents, each in its own stacked pane on the right.*
 
 ## What you get
 
