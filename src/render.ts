@@ -13,6 +13,15 @@ export interface RenderOptions {
 	color: boolean;
 	/** How many trailing non-empty lines of each thinking block to show; 0 hides thinking. */
 	thinkingLines: number;
+	/** Session totals accumulated by the viewer; shown on `session_exit` when supplied. */
+	totals?: SessionTotals;
+}
+
+/** Token/cost/duration totals accumulated across one transcript session. */
+export interface SessionTotals {
+	tokens: number;
+	cost: number;
+	durationMs: number | null;
 }
 
 type Style = "bold" | "dim" | "red" | "green" | "cyan";
@@ -67,6 +76,37 @@ export function summarizeArgs(args: unknown): string {
 	return stringifyCollapsed(args);
 }
 
+/**
+ * Token and cost totals of one assistant message entry. Non-assistant entries, and entries
+ * without a numeric usage, yield `null`/zeros; the result feeds the `session_exit` totals line.
+ */
+export function usageOf(entry: unknown): { tokens: number; cost: number } | null {
+	const record = recordOf(entry);
+	if (record === null || record["type"] !== "message") return null;
+	const message = recordOf(record["message"]);
+	if (message === null || message["role"] !== "assistant") return null;
+	const usage = recordOf(message["usage"]);
+	if (usage === null) return { tokens: 0, cost: 0 };
+	const cost = recordOf(usage["cost"]);
+	const totalTokens = usage["totalTokens"];
+	const totalCost = cost === null ? undefined : cost["total"];
+	return {
+		tokens: typeof totalTokens === "number" && Number.isFinite(totalTokens) ? totalTokens : 0,
+		cost: typeof totalCost === "number" && Number.isFinite(totalCost) ? totalCost : 0,
+	};
+}
+
+/**
+ * Remove everything a transcript could smuggle into the terminal: ANSI escape sequences
+ * (CSI/OSC, `Bun.stripANSI`), then any remaining C0 control except `\n` (tab becomes one space),
+ * plus DEL and the C1 range. Styling is applied after sanitizing, so `STYLE_CODES` survive.
+ */
+export function sanitize(text: string): string {
+	return Bun.stripANSI(text)
+		.replace(/\t/gu, " ")
+		.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu, "");
+}
+
 // -- entry renderers ---------------------------------------------------------
 
 function renderSessionInit(record: Record<string, unknown>, options: RenderOptions): string[] {
@@ -92,7 +132,7 @@ function renderUserMessage(message: Record<string, unknown>, options: RenderOpti
 	if (!Array.isArray(content)) return [];
 	const lines = nonEmptyLines(joinTextBlocks(content));
 	if (lines[0] === USER_TEXT_MARKER) lines.shift();
-	const out = ["Task:"];
+	const out = [composeLine([{ text: "Task:", style: "bold" }], options, true)];
 	for (const line of lines.slice(0, USER_TEXT_LINE_LIMIT)) {
 		out.push(composeLine([{ text: `  ${line}`, style: "dim" }], options, true));
 	}
@@ -110,6 +150,14 @@ function renderAssistantMessage(message: Record<string, unknown>, options: Rende
 		if (blockType === "thinking") out.push(...renderThinkingBlock(record, options));
 		else if (blockType === "text") out.push(...renderTextBlock(record, options));
 		else if (blockType === "toolCall") out.push(...renderToolCallBlock(record, options));
+	}
+	const stopReason = message["stopReason"];
+	if (stopReason === "error") {
+		const errorMessage = stringProp(message, "errorMessage");
+		const collapsed = errorMessage === null ? "" : collapseWhitespace(errorMessage);
+		out.push(composeLine([{ text: collapsed.length > 0 ? `✗ error: ${collapsed}` : "✗ error", style: "red" }], options, true));
+	} else if (stopReason === "aborted") {
+		out.push(composeLine([{ text: "✗ aborted", style: "red" }], options, true));
 	}
 	return out;
 }
@@ -135,13 +183,36 @@ function renderToolCallBlock(record: Record<string, unknown>, options: RenderOpt
 	if (name === null || name.length === 0) return [];
 	const intent = stringProp(record, "intent");
 	const collapsedIntent = intent === null ? "" : collapseWhitespace(intent);
-	const summary = collapsedIntent.length > 0 ? collapsedIntent : summarizeArgs(record["arguments"]);
+	let summary: string;
+	if (collapsedIntent.length > 0) summary = collapsedIntent;
+	else if (name === "yield") summary = yieldSummary(record["arguments"]);
+	else summary = summarizeArgs(record["arguments"]);
 	const segments: Segment[] = [
 		{ text: "▸ ", style: null },
 		{ text: name, style: "cyan" },
 	];
 	if (summary.length > 0) segments.push({ text: `  ${summary}`, style: null });
 	return [composeLine(segments, options, true)];
+}
+
+/** One-liner for a `yield` call: its error, or `status` plus the remaining `data` keys. */
+function yieldSummary(args: unknown): string {
+	const record = recordOf(args);
+	if (record === null) return summarizeArgs(args);
+	const error = record["error"];
+	if (typeof error === "string") {
+		const collapsed = collapseWhitespace(error);
+		return collapsed.length > 0 ? `error: ${collapsed}` : "error";
+	}
+	const data = recordOf(record["data"]);
+	if (data === null) return summarizeArgs(args);
+	const keys = Object.keys(data).filter((key) => key !== "status");
+	const status = data["status"];
+	if (typeof status === "string") {
+		const head = `status: ${collapseWhitespace(status)}`;
+		return keys.length > 0 ? `${head} · ${keys.join(", ")}` : head;
+	}
+	return keys.length > 0 ? keys.join(", ") : summarizeArgs(args);
 }
 
 function renderToolResultMessage(message: Record<string, unknown>, options: RenderOptions): string[] {
@@ -152,6 +223,8 @@ function renderToolResultMessage(message: Record<string, unknown>, options: Rend
 		{ text: "  ", style: null },
 		{ text: isError ? "✗" : "✓", style: isError ? "red" : "green" },
 	];
+	const toolName = stringProp(message, "toolName");
+	if (toolName !== null && toolName.length > 0) segments.push({ text: ` ${toolName} `, style: "cyan" });
 	const first = lines[0];
 	if (first === undefined) {
 		segments.push({ text: " (no output)", style: null });
@@ -165,12 +238,38 @@ function renderToolResultMessage(message: Record<string, unknown>, options: Rend
 
 function renderCustom(record: Record<string, unknown>, options: RenderOptions): string[] {
 	if (record["customType"] !== "session_exit") return [];
-	return [composeLine([{ text: "■ session ended", style: "dim" }], options, true)];
+	const parts: string[] = [];
+	const totals = options.totals;
+	if (totals !== undefined) {
+		if (totals.tokens > 0) parts.push(`${formatTokens(totals.tokens)} tok`);
+		if (totals.cost !== 0) parts.push(`$${totals.cost.toFixed(4)}`);
+		if (totals.durationMs !== null) parts.push(formatDuration(totals.durationMs));
+	}
+	const text = parts.length === 0 ? "■ session ended" : `■ session ended · ${parts.join(" · ")}`;
+	return [composeLine([{ text, style: "dim" }], options, true)];
+}
+
+/** `999`, `47.2k`, `1.2M`. */
+function formatTokens(tokens: number): string {
+	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+	if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+	return String(Math.round(tokens));
+}
+
+/** `45s`, `2m13s`, `1h04m`. */
+function formatDuration(durationMs: number): string {
+	const seconds = Math.max(0, Math.round(durationMs / 1000));
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor((seconds % 3600) / 60);
+	if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`;
+	if (minutes > 0) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
+	return `${seconds}s`;
 }
 
 // -- text helpers ------------------------------------------------------------
 
-function recordOf(value: unknown): Record<string, unknown> | null {
+/** Narrow an external value to a plain record; the only cast of transcript data in this module. */
+export function recordOf(value: unknown): Record<string, unknown> | null {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
 	return value as Record<string, unknown>;
 }
@@ -244,15 +343,17 @@ function sliceVisible(text: string, maxWidth: number): string {
 }
 
 /**
- * Compose one display line from styled segments. Non-text lines that exceed `width` are cut to
- * `width - 1` visible columns plus an ellipsis; the cut happens on plain text, before ANSI.
+ * Compose one display line from styled segments. Segment text is sanitized first, so no terminal
+ * control sequence can reach the output; styling is added afterwards. Non-text lines that exceed
+ * `width` are cut to `width - 1` visible columns plus an ellipsis on the plain text, before ANSI.
  */
 function composeLine(segments: Segment[], options: RenderOptions, truncate: boolean): string {
+	const clean = segments.map((segment) => ({ text: sanitize(segment.text), style: segment.style }));
 	const width = normalizeWidth(options.width);
-	let finalSegments = segments;
+	let finalSegments = clean;
 	if (truncate) {
-		const plain = segments.map((segment) => segment.text).join("");
-		if (Bun.stringWidth(plain) > width) finalSegments = truncateSegments(segments, width);
+		const plain = clean.map((segment) => segment.text).join("");
+		if (Bun.stringWidth(plain) > width) finalSegments = truncateSegments(clean, width);
 	}
 	if (!options.color) return finalSegments.map((segment) => segment.text).join("");
 	return finalSegments
@@ -281,7 +382,7 @@ function truncateSegments(segments: Segment[], width: number): Segment[] {
 
 /** Word-wrap `text` to `width`, hard-breaking words longer than `width`; blank lines are kept. */
 function wrapText(text: string, width: number): string[] {
-	const normalized = text.replace(/\r\n?/gu, "\n").replace(/\n+$/u, "");
+	const normalized = sanitize(text).replace(/\r\n?/gu, "\n").replace(/\n+$/u, "");
 	if (normalized.trim().length === 0) return [];
 	const out: string[] = [];
 	for (const raw of normalized.split("\n")) {
@@ -291,6 +392,7 @@ function wrapText(text: string, width: number): string[] {
 			continue;
 		}
 		let current = "";
+		let currentWidth = 0;
 		for (const word of words) {
 			let rest = word;
 			while (Bun.stringWidth(rest) > width) {
@@ -299,16 +401,23 @@ function wrapText(text: string, width: number): string[] {
 				if (current.length > 0) {
 					out.push(current);
 					current = "";
+					currentWidth = 0;
 				}
 				out.push(head);
 				rest = rest.slice(head.length);
 			}
 			if (rest.length === 0) continue;
-			if (current.length === 0) current = rest;
-			else if (Bun.stringWidth(current) + 1 + Bun.stringWidth(rest) <= width) current += ` ${rest}`;
-			else {
+			const restWidth = Bun.stringWidth(rest);
+			if (current.length === 0) {
+				current = rest;
+				currentWidth = restWidth;
+			} else if (currentWidth + 1 + restWidth <= width) {
+				current += ` ${rest}`;
+				currentWidth += 1 + restWidth;
+			} else {
 				out.push(current);
 				current = rest;
+				currentWidth = restWidth;
 			}
 		}
 		if (current.length > 0) out.push(current);

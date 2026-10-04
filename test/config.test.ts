@@ -24,6 +24,7 @@ test("readConfig falls back to the documented defaults", () => {
 		mainPaneId: "w1:p1",
 		ratio: 0.6,
 		closeDelayMs: 3000,
+		failCloseDelayMs: 10000,
 		maxPanes: 6,
 	});
 	expect(readConfig({ HERDR_PANE_ID: "w1:p1", OMP_HERDR_PANES: "1" })?.maxPanes).toBe(6);
@@ -35,9 +36,10 @@ test("readConfig honours valid overrides", () => {
 			HERDR_PANE_ID: "w1:p1",
 			OMP_HERDR_PANES_RATIO: "0.5",
 			OMP_HERDR_PANES_CLOSE_DELAY_MS: "0",
+			OMP_HERDR_PANES_FAIL_DELAY_MS: "60000",
 			OMP_HERDR_PANES_MAX: "3",
 		}),
-	).toEqual({ mainPaneId: "w1:p1", ratio: 0.5, closeDelayMs: 0, maxPanes: 3 });
+	).toEqual({ mainPaneId: "w1:p1", ratio: 0.5, closeDelayMs: 0, failCloseDelayMs: 60000, maxPanes: 3 });
 	expect(readConfig({ HERDR_PANE_ID: "w1:p1", OMP_HERDR_PANES_RATIO: "0.2" })?.ratio).toBe(0.2);
 	expect(readConfig({ HERDR_PANE_ID: "w1:p1", OMP_HERDR_PANES_RATIO: "0.9" })?.ratio).toBe(0.9);
 });
@@ -47,9 +49,16 @@ test("readConfig falls back per field on invalid values", () => {
 		HERDR_PANE_ID: "w1:p1",
 		OMP_HERDR_PANES_RATIO: "abc",
 		OMP_HERDR_PANES_CLOSE_DELAY_MS: "-1",
+		OMP_HERDR_PANES_FAIL_DELAY_MS: "soon",
 		OMP_HERDR_PANES_MAX: "1.5",
 	});
-	expect(config).toEqual({ mainPaneId: "w1:p1", ratio: 0.6, closeDelayMs: 3000, maxPanes: 6 });
+	expect(config).toEqual({
+		mainPaneId: "w1:p1",
+		ratio: 0.6,
+		closeDelayMs: 3000,
+		failCloseDelayMs: 10000,
+		maxPanes: 6,
+	});
 
 	expect(readConfig({ HERDR_PANE_ID: "w1:p1", OMP_HERDR_PANES_RATIO: "0.05" })?.ratio).toBe(0.6);
 	expect(readConfig({ HERDR_PANE_ID: "w1:p1", OMP_HERDR_PANES_RATIO: "1" })?.ratio).toBe(0.6);

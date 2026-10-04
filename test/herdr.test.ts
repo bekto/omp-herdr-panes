@@ -132,3 +132,25 @@ test("the CLI wrapper reads errors from stderr and accepts a silent `pane run`",
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("a hung herdr call is killed and rejects with code timeout", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "herdr-test-"));
+	const bin = join(dir, "herdr");
+	await Bun.write(bin, "#!/bin/sh\nexec sleep 10\n");
+	chmodSync(bin, 0o755);
+
+	try {
+		const started = Date.now();
+		const error = await createHerdrCli(bin, 100)
+			.rename("w3:p2", "x")
+			.then(
+				() => null,
+				(reason: unknown) => reason,
+			);
+		expect(error).toBeInstanceOf(HerdrError);
+		expect((error as HerdrError).code).toBe("timeout");
+		expect(Date.now() - started).toBeLessThan(2000);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});

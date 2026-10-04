@@ -15,10 +15,12 @@ export interface PaneManagerConfig {
 	mainPaneId: string;
 	/** Width share kept by the main pane on the first split, e.g. 0.6. */
 	ratio: number;
-	/** Max simultaneously open subagent panes. */
+	/** Max simultaneously open subagent panes; extra subagents wait in FIFO order for a slot. */
 	maxPanes: number;
-	/** Delay between finish() and closing the pane. */
+	/** Delay between a `completed` finish() and closing the pane. */
 	closeDelayMs: number;
+	/** Delay between any other (failed, aborted, …) finish() and closing the pane. */
+	failCloseDelayMs: number;
 	/** Shell command typed into a new pane. */
 	viewerCommand(sessionFile: string, label: string): string;
 }
@@ -32,6 +34,8 @@ interface Entry {
 	/** Open order, monotonically increasing; breaks height ties when picking the split target. */
 	order: number;
 	done: boolean;
+	/** Terminal lifecycle status (`completed`, `failed`, `aborted`, …) once done. */
+	status?: string;
 	timer?: { cancel(): void };
 }
 
@@ -44,6 +48,8 @@ export class PaneManager {
 	readonly #logger: Log;
 	readonly #schedule: Schedule;
 	readonly #entries = new Map<string, Entry>();
+	/** Subagents that started while every slot was taken: key → label, in arrival order. */
+	readonly #waiting = new Map<string, string>();
 	/** Tail of the serialized herdr job chain. Never rejects. */
 	#queue: Promise<void> = Promise.resolve();
 	#nextOrder = 0;
@@ -59,17 +65,28 @@ export class PaneManager {
 			});
 	}
 
-	/** Open a pane for this subagent (key = its sessionFile). Resolves when the herdr calls finished. Never rejects. */
+	/**
+	 * Open a pane for this subagent (key = its sessionFile). Resolves when the herdr calls finished.
+	 * At the pane limit the oldest finished pane makes room; without one the subagent waits for a
+	 * free slot. Never rejects.
+	 */
 	open(key: string, label: string): Promise<void> {
 		const existing = this.#entries.get(key);
 		if (existing !== undefined) {
 			// A repeated `started` event revives the subagent: drop the pending close, keep its pane.
 			this.#cancelTimer(existing);
 			existing.done = false;
+			if (existing.status !== undefined) {
+				existing.status = undefined;
+				const paneId = existing.paneId;
+				if (paneId !== undefined) void this.#enqueue(() => this.#rename(key, paneId, existing));
+			}
 			return this.#queue;
 		}
-		if (this.#entries.size >= this.#config.maxPanes) {
-			this.#log("pane limit reached", { key });
+		if (this.#waiting.has(key)) return Promise.resolve();
+		if (this.#entries.size >= this.#config.maxPanes && !this.#evictFinished()) {
+			this.#log("pane limit reached, waiting for a free slot", { key });
+			this.#waiting.set(key, label);
 			return Promise.resolve();
 		}
 		// Insert before enqueuing, so a finish() arriving while herdr is still working is not lost.
@@ -79,13 +96,20 @@ export class PaneManager {
 		return this.#enqueue(() => this.#openPane(key, entry));
 	}
 
-	/** The subagent reached a terminal state: close its pane after closeDelayMs. Never throws. */
-	finish(key: string): void {
+	/**
+	 * The subagent reached a terminal `status`: mark its pane title ✓/✗ and close it after
+	 * closeDelayMs (`completed`) or failCloseDelayMs (anything else). Never throws.
+	 */
+	finish(key: string, status: string): void {
+		if (this.#waiting.delete(key)) return;
 		const entry = this.#entries.get(key);
 		if (entry === undefined) return;
 		entry.done = true;
-		// No pane yet: open's job schedules the close as soon as the split returns.
-		if (entry.paneId === undefined) return;
+		entry.status = status;
+		// No pane yet: open's job applies the title and schedules the close once the split returns.
+		const paneId = entry.paneId;
+		if (paneId === undefined) return;
+		void this.#enqueue(() => this.#rename(key, paneId, entry));
 		this.#scheduleClose(key, entry);
 	}
 
@@ -95,6 +119,7 @@ export class PaneManager {
 		for (const [, entry] of closing) this.#cancelTimer(entry);
 		// Forgotten right away: a pane opened from here on belongs to a new subagent.
 		this.#entries.clear();
+		this.#waiting.clear();
 		await this.#enqueue(async () => {
 			for (const [key, entry] of closing) {
 				// Set late by an open job queued ahead of this one, hence read at run time.
@@ -133,15 +158,15 @@ export class PaneManager {
 			paneId = await this.#splitFor(key);
 		} catch (error) {
 			this.#log("pane split failed", { key, error: describeError(error) });
-			if (this.#entries.get(key) === entry) this.#entries.delete(key);
+			if (this.#entries.get(key) === entry) {
+				this.#entries.delete(key);
+				this.#promote();
+			}
 			return;
 		}
 		entry.paneId = paneId;
-		try {
-			await this.#herdr.rename(paneId, entry.label);
-		} catch (error) {
-			this.#log("pane rename failed", { key, paneId, error: describeError(error) });
-		}
+		// Titled at run time: finish() may already have set the ✓/✗ status.
+		await this.#rename(key, paneId, entry);
 		try {
 			await this.#herdr.run(paneId, this.#config.viewerCommand(key, entry.label));
 		} catch (error) {
@@ -179,13 +204,66 @@ export class PaneManager {
 		return stacked;
 	}
 
-	/** Schedules the delayed close of a finished entry; a second call while one is pending is a no-op. */
+	/**
+	 * Schedules the delayed close of a finished entry; a second call while one is pending is a no-op.
+	 * With subagents waiting for a slot the pane closes right away instead.
+	 */
 	#scheduleClose(key: string, entry: Entry): void {
 		if (entry.timer !== undefined) return;
+		const delay =
+			this.#waiting.size > 0
+				? 0
+				: entry.status === "completed"
+					? this.#config.closeDelayMs
+					: this.#config.failCloseDelayMs;
 		entry.timer = this.#schedule(() => {
 			entry.timer = undefined;
 			void this.#enqueueClose(key, entry);
-		}, this.#config.closeDelayMs);
+		}, delay);
+	}
+
+	/**
+	 * Makes room at the pane limit by closing the oldest finished pane now (skipping its close
+	 * delay). Returns false when no finished pane exists.
+	 */
+	#evictFinished(): boolean {
+		let oldestKey: string | undefined;
+		let oldest: Entry | undefined;
+		for (const [key, entry] of this.#entries) {
+			// Without a pane id the open job is still running; it closes the pane itself.
+			if (!entry.done || entry.paneId === undefined) continue;
+			if (oldest === undefined || entry.order < oldest.order) {
+				oldestKey = key;
+				oldest = entry;
+			}
+		}
+		if (oldestKey === undefined || oldest === undefined) return false;
+		const key = oldestKey;
+		const paneId = oldest.paneId;
+		if (paneId === undefined) return false;
+		this.#cancelTimer(oldest);
+		this.#entries.delete(key);
+		void this.#enqueue(() => this.#closePane(paneId, key));
+		return true;
+	}
+
+	/** Opens panes for waiting subagents while slots are free, oldest first. */
+	#promote(): void {
+		for (const [key, label] of this.#waiting) {
+			if (this.#entries.size >= this.#config.maxPanes) return;
+			this.#waiting.delete(key);
+			void this.open(key, label);
+		}
+	}
+
+	/** Sets the pane title: the label, prefixed with ✓/✗ once the subagent finished. */
+	async #rename(key: string, paneId: string, entry: Entry): Promise<void> {
+		const mark = entry.status === undefined ? "" : entry.status === "completed" ? "✓ " : "✗ ";
+		try {
+			await this.#herdr.rename(paneId, `${mark}${entry.label}`);
+		} catch (error) {
+			this.#log("pane rename failed", { key, paneId, error: describeError(error) });
+		}
 	}
 
 	/** Queues the actual close; the entry must still be the finished one when the job finally runs. */
@@ -197,6 +275,7 @@ export class PaneManager {
 			if (paneId === undefined) return;
 			// Forgotten before awaiting: a revive during the close gets a fresh pane of its own.
 			this.#entries.delete(key);
+			this.#promote();
 			await this.#closePane(paneId, key);
 		});
 	}

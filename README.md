@@ -16,12 +16,15 @@ itself a few seconds after its subagent finishes, and your omp pane goes back to
 
 - **One pane per subagent**, stacked in a single column to the right of omp and titled
   `<name> · <agent>`.
-- **Live output**: task prompt, a short preview of the thinking, tool calls with their intent, and
-  results, updated as the subagent writes its transcript.
+- **Live output**: task prompt, a short preview of the thinking, tool calls with their intent,
+  results tagged with their tool name, and errors, updated as the subagent writes its transcript.
+  When the subagent ends, a summary line shows its tokens, cost and duration.
 - **Nested subagents too**: a subagent that spawns its own subagents gets panes for them as well
   (e.g. `Outer · task` and `Outer.Inner · sonic`).
-- **Automatic cleanup**: each pane closes ~3 s after its subagent finishes; quitting omp closes
-  them all.
+- **Outcome at a glance**: when a subagent ends, its pane title gets a `✓` (completed) or `✗`
+  (failed, aborted) prefix.
+- **Automatic cleanup**: a pane closes ~3 s after its subagent completes, ~10 s after it fails;
+  quitting omp closes them all, and if omp is killed the panes close by themselves within a second.
 - **Stays out of your way**: keyboard focus never leaves the omp pane, and you can keep typing
   while subagents run.
 - **No effect outside Herdr**: if omp is not running inside a Herdr pane, the extension does
@@ -93,8 +96,9 @@ Set these environment variables before starting omp. They are read once, when th
 | --- | --- | --- |
 | `OMP_HERDR_PANES` | `1` | `0` turns the extension off |
 | `OMP_HERDR_PANES_RATIO` | `0.6` | share of the width kept by the omp pane when the column opens (`0.2`–`0.9`) |
-| `OMP_HERDR_PANES_CLOSE_DELAY_MS` | `3000` | how long a pane stays open after its subagent finishes |
-| `OMP_HERDR_PANES_MAX` | `6` | max panes open at once; extra subagents run normally, just without a pane |
+| `OMP_HERDR_PANES_CLOSE_DELAY_MS` | `3000` | how long a pane stays open after its subagent completes |
+| `OMP_HERDR_PANES_FAIL_DELAY_MS` | `10000` | how long a pane stays open after its subagent fails or is aborted |
+| `OMP_HERDR_PANES_MAX` | `6` | max panes open at once; extra subagents wait for a slot (a finished pane gives up its slot right away) |
 
 An invalid value falls back to that variable's default.
 
@@ -113,9 +117,9 @@ OMP_HERDR_PANES_MAX=4 OMP_HERDR_PANES_CLOSE_DELAY_MS=10000 omp
 - The extension adds no model calls or tokens and does not change subagent behaviour. It only reads
   the transcripts omp already writes to disk.
 - Opening or closing a pane runs a few short `herdr` CLI commands, one after another, without
-  blocking omp.
-- Each open pane runs one small viewer process that tails a file. `OMP_HERDR_PANES_MAX` caps how
-  many run at once.
+  blocking omp. A herdr call that hangs is killed after 5 s.
+- Each open pane runs one small viewer process that tails a file, polling every 250 ms while the
+  subagent runs and every 2 s after it ended. `OMP_HERDR_PANES_MAX` caps how many run at once.
 
 ## How it works
 
@@ -130,11 +134,12 @@ omp session ── task:subagent:lifecycle event ──▶ src/index.ts
 ```
 
 - The extension listens for omp's `task:subagent:lifecycle` events. `started` opens a pane; any
-  other status (completed, failed, aborted, …) schedules the close.
+  other status (completed, failed, aborted) marks the title and schedules the close.
 - The first pane is split off the omp pane to the right. Each later pane is split downwards off
   the tallest pane in the column.
 - Each pane runs `src/viewer.ts`, which follows the subagent's transcript file and prints each new
-  entry.
+  entry. Control and escape sequences in transcript text are stripped, so tool output can't
+  restyle or retitle the pane. The viewer exits when the omp process is gone.
 - All herdr commands are queued and run one at a time, so subagents started together never race
   each other's splits. Any herdr failure is caught and skipped, so it can't take down your omp
   session.

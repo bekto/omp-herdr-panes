@@ -10,9 +10,11 @@ export interface Config {
 	mainPaneId: string;
 	/** Width share kept by the main pane on the first split. */
 	ratio: number;
-	/** Delay between a subagent reaching a terminal state and its pane closing. */
+	/** Delay between a subagent completing successfully and its pane closing. */
 	closeDelayMs: number;
-	/** Max simultaneously open subagent panes; extra subagents get no pane. */
+	/** Delay before closing the pane of a failed or aborted subagent. */
+	failCloseDelayMs: number;
+	/** Max simultaneously open subagent panes; extra subagents wait for a free slot. */
 	maxPanes: number;
 }
 
@@ -20,6 +22,7 @@ const DEFAULT_RATIO = 0.6;
 const MIN_RATIO = 0.2;
 const MAX_RATIO = 0.9;
 const DEFAULT_CLOSE_DELAY_MS = 3000;
+const DEFAULT_FAIL_CLOSE_DELAY_MS = 10000;
 const DEFAULT_MAX_PANES = 6;
 
 /** Reads a numeric override, falling back to `fallback` when it is malformed or out of range. */
@@ -60,6 +63,11 @@ export function readConfig(env: Record<string, string | undefined>): Config | nu
 		mainPaneId,
 		ratio: readNumber(env["OMP_HERDR_PANES_RATIO"], DEFAULT_RATIO, isRatio),
 		closeDelayMs: readNumber(env["OMP_HERDR_PANES_CLOSE_DELAY_MS"], DEFAULT_CLOSE_DELAY_MS, isCloseDelay),
+		failCloseDelayMs: readNumber(
+			env["OMP_HERDR_PANES_FAIL_DELAY_MS"],
+			DEFAULT_FAIL_CLOSE_DELAY_MS,
+			isCloseDelay,
+		),
 		maxPanes: readNumber(env["OMP_HERDR_PANES_MAX"], DEFAULT_MAX_PANES, isMaxPanes),
 	};
 }

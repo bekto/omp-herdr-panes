@@ -144,14 +144,31 @@ export function parseLayoutResponse(json: unknown): LayoutPane[] {
 	return panes;
 }
 
+/** A herdr call normally answers in milliseconds; a hung one must not stall the pane queue forever. */
+const CLI_TIMEOUT_MS = 5000;
+
 /** Runs `<bin> <args…>`, parses its JSON output, and rejects herdr error payloads. */
-async function runCli(bin: string, args: string[]): Promise<unknown> {
+async function runCli(bin: string, args: string[], timeoutMs: number): Promise<unknown> {
 	const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" });
-	const [stdoutText, stderrText] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	const exitCode = await proc.exited;
+	let timer: Timer | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			proc.kill("SIGKILL");
+			reject(new HerdrError("timeout", `${bin} ${args.join(" ")} timed out after ${timeoutMs} ms`));
+		}, timeoutMs);
+	});
+	let stdoutText: string;
+	let stderrText: string;
+	let exitCode: number;
+	try {
+		// Raced, not awaited after the kill: a grandchild could keep the pipes open indefinitely.
+		[stdoutText, stderrText, exitCode] = await Promise.race([
+			Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]),
+			timeout,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
 
 	const stdout = stdoutText.trim();
 	const stderr = stderrText.trim();
@@ -184,12 +201,14 @@ function failureDetail(bin: string, stdout: string, stderr: string, exitCode: nu
 	return exitCode === 0 ? `${bin} printed nothing` : `${bin} exited with code ${exitCode}`;
 }
 
-export function createHerdrCli(bin?: string): Herdr {
+/** `timeoutMs` bounds every call; a call that exceeds it is killed and rejects with code `timeout`. */
+export function createHerdrCli(bin?: string, timeoutMs = CLI_TIMEOUT_MS): Herdr {
 	const resolved = bin ?? process.env.HERDR_BIN_PATH ?? "herdr";
+	const cli = (args: string[]): Promise<unknown> => runCli(resolved, args, timeoutMs);
 
 	return {
 		async split(target: string, direction: "right" | "down", ratio: number): Promise<string> {
-			const json = await runCli(resolved, [
+			const json = await cli([
 				"pane",
 				"split",
 				target,
@@ -204,16 +223,16 @@ export function createHerdrCli(bin?: string): Herdr {
 
 		async run(paneId: string, command: string): Promise<void> {
 			// `command` stays a single argv element: herdr types it into the pane's shell verbatim.
-			assertOk(await runCli(resolved, ["pane", "run", paneId, command]));
+			assertOk(await cli(["pane", "run", paneId, command]));
 		},
 
 		async rename(paneId: string, label: string): Promise<void> {
-			assertOk(await runCli(resolved, ["pane", "rename", paneId, label]));
+			assertOk(await cli(["pane", "rename", paneId, label]));
 		},
 
 		async close(paneId: string): Promise<void> {
 			try {
-				assertOk(await runCli(resolved, ["pane", "close", paneId]));
+				assertOk(await cli(["pane", "close", paneId]));
 			} catch (error) {
 				if (error instanceof HerdrError && error.code === "pane_not_found") return;
 				throw error;
@@ -221,7 +240,7 @@ export function createHerdrCli(bin?: string): Herdr {
 		},
 
 		async layout(paneId: string): Promise<LayoutPane[]> {
-			const json = await runCli(resolved, ["pane", "layout", "--pane", paneId]);
+			const json = await cli(["pane", "layout", "--pane", paneId]);
 			return parseLayoutResponse(json);
 		},
 	};

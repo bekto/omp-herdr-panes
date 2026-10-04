@@ -1,6 +1,6 @@
 {
 	"name": "omp-herdr-panes",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"private": true,
 	"type": "module",
 	"description": "Oh My Pi extension: show each omp subagent in its own stacked Herdr pane",

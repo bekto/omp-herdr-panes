@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { type RenderOptions, renderEntry, summarizeArgs } from "../src/render.ts";
+import { type RenderOptions, renderEntry, summarizeArgs, usageOf } from "../src/render.ts";
 
 const WIDTH = 80;
 
@@ -45,9 +45,26 @@ test("toolCall with intent renders `▸ <name>  <intent>`", () => {
 });
 
 test("toolCall without intent falls back to the collapsed arguments JSON", () => {
-	const entry = assistant({ type: "toolCall", name: "yield", arguments: { data: { nested: true } } });
-	expect(render(entry)).toEqual(['▸ yield  {"data":{"nested":true}}']);
+	const entry = assistant({ type: "toolCall", name: "bash", arguments: { data: { nested: true } } });
+	expect(render(entry)).toEqual(['▸ bash  {"data":{"nested":true}}']);
 	expect(summarizeArgs({ data: { nested: true } })).toBe('{"data":{"nested":true}}');
+});
+
+test("yield without intent summarizes its data record readably", () => {
+	const complete = assistant({
+		type: "toolCall",
+		name: "yield",
+		arguments: { data: { status: "complete", checks: { tsc: "clean" }, files_changed: ["a.ts"] } },
+	});
+	expect(render(complete)).toEqual(["▸ yield  status: complete · checks, files_changed"]);
+	const withError = assistant({ type: "toolCall", name: "yield", arguments: { error: "boom\nnow" } });
+	expect(render(withError)).toEqual(["▸ yield  error: boom now"]);
+	const statusOnly = assistant({ type: "toolCall", name: "yield", arguments: { data: { status: "done" } } });
+	expect(render(statusOnly)).toEqual(["▸ yield  status: done"]);
+	const keysOnly = assistant({ type: "toolCall", name: "yield", arguments: { data: { checks: "clean", files_changed: [] } } });
+	expect(render(keysOnly)).toEqual(["▸ yield  checks, files_changed"]);
+	const noData = assistant({ type: "toolCall", name: "yield", arguments: { other: 1 } });
+	expect(render(noData)).toEqual(['▸ yield  {"other":1}']);
 });
 
 test("toolCall with a multi-line command collapses newlines", () => {
@@ -55,13 +72,21 @@ test("toolCall with a multi-line command collapses newlines", () => {
 	expect(render(entry)).toEqual(["▸ bash  ls -la pwd"]);
 });
 
-test("toolResult renders the first line, the remainder count and errors", () => {
-	expect(render(toolResult("hi\n\n\nWall time: 3.05 seconds"))).toEqual(["  ✓ hi (+1 lines)"]);
+test("toolResult renders the tool name, first line, remainder count and errors", () => {
+	expect(render(toolResult("hi\n\n\nWall time: 3.05 seconds"))).toEqual(["  ✓ bash  hi (+1 lines)"]);
 	const failed = render(toolResult("boom", true));
 	expect(failed).toHaveLength(1);
-	expect(failed[0]?.startsWith("  ✗")).toBe(true);
-	expect(render(toolResult("only line"))).toEqual(["  ✓ only line"]);
-	expect(render(toolResult(""))).toEqual(["  ✓ (no output)"]);
+	expect(failed[0]?.startsWith("  ✗ bash")).toBe(true);
+	expect(render(toolResult("only line"))).toEqual(["  ✓ bash  only line"]);
+	expect(render(toolResult(""))).toEqual(["  ✓ bash  (no output)"]);
+});
+
+test("toolResult omits the tool name when missing or empty, styles it cyan otherwise", () => {
+	const bare = { type: "message", message: { role: "toolResult", toolName: "", content: [{ type: "text", text: "hi" }] } };
+	expect(render(bare)).toEqual(["  ✓ hi"]);
+	const named = { type: "message", message: { role: "toolResult", toolName: "read", content: [{ type: "text", text: "hi" }] } };
+	expect(render(named, { color: true }).join("")).toContain("\x1b[36m read \x1b[0m");
+	expect(render(named, { color: false })).toEqual(["  ✓ read  hi"]);
 });
 
 test("assistant blocks render in order and honour thinkingLines", () => {
@@ -146,6 +171,66 @@ test("malformed and irrelevant entries render nothing", () => {
 	for (const entry of ignored) expect(render(entry)).toEqual([]);
 });
 
+test("control sequences never reach the output, with or without color", () => {
+	const evil = "\x1b]0;pwned\x07\x1b[31mred\x1b[0m";
+	expect(render(toolResult(evil))).toEqual(["  ✓ bash  red"]);
+	const plain = render(toolResult(evil), { color: false }).join("");
+	expect(plain).not.toContain("\x1b");
+	expect(plain).not.toContain("\x07");
+	const colored = render(toolResult(evil), { color: true }).join("");
+	expect(colored).not.toContain("pwned");
+	expect(colored).not.toContain("\x1b[31m");
+	expect(colored).toBe("  \x1b[32m✓\x1b[0m\x1b[36m bash \x1b[0m red");
+});
+
+test("C0 controls (except newline), DEL and C1 are removed; tab becomes a space", () => {
+	const entry = assistant({ type: "text", text: "a\tb\x01c\x7fd\x85e\rf\none\x07 two" });
+	expect(render(entry, { thinkingLines: 0 })).toEqual(["a bcdef", "one two"]);
+});
+
+test("truncation width is measured after stripping control sequences", () => {
+	const entry = assistant({ type: "toolCall", name: "bash", arguments: {}, intent: `\x1b[31m${"x".repeat(300)}` });
+	const line = render(entry, { width: 40 })[0] ?? "";
+	expect(Bun.stringWidth(line)).toBe(40);
+	expect(line.startsWith("▸ bash  ")).toBe(true);
+	expect(line.endsWith("…")).toBe(true);
+	expect(line).not.toContain("\x1b");
+});
+
+test("assistant stopReason error and aborted append a red line after the content", () => {
+	const errored = {
+		type: "message",
+		message: { role: "assistant", stopReason: "error", errorMessage: "boom\nnow", content: [{ type: "text", text: "partial" }] },
+	};
+	expect(render(errored)).toEqual(["partial", "✗ error: boom now"]);
+	expect(render(errored, { color: true }).join("")).toContain("\x1b[31m✗ error: boom now\x1b[0m");
+	expect(render({ type: "message", message: { role: "assistant", stopReason: "error", content: [] } })).toEqual(["✗ error"]);
+	expect(render({ type: "message", message: { role: "assistant", stopReason: "aborted", content: [] } })).toEqual(["✗ aborted"]);
+});
+
+test("usageOf reads assistant usage and rejects everything else", () => {
+	const entry = { type: "message", message: { role: "assistant", usage: { totalTokens: 10, cost: { total: 0.5 } } } };
+	expect(usageOf(entry)).toEqual({ tokens: 10, cost: 0.5 });
+	expect(usageOf({ type: "message", message: { role: "assistant" } })).toEqual({ tokens: 0, cost: 0 });
+	expect(usageOf({ type: "message", message: { role: "user", usage: { totalTokens: 10 } } })).toBeNull();
+	expect(usageOf({ type: "custom", customType: "session_exit" })).toBeNull();
+	expect(usageOf(null)).toBeNull();
+});
+
+test("session_exit renders totals", () => {
+	const exit = { type: "custom", customType: "session_exit", data: {}, timestamp: "2026-10-03T16:05:03.544Z" };
+	expect(render(exit, { totals: { tokens: 47200, cost: 0.0008, durationMs: 133000 } })).toEqual([
+		"■ session ended · 47.2k tok · $0.0008 · 2m13s",
+	]);
+	expect(render(exit, { totals: { tokens: 999, cost: 0, durationMs: null } })).toEqual(["■ session ended · 999 tok"]);
+	expect(render(exit, { totals: { tokens: 1_200_000, cost: 0, durationMs: 3_840_000 } })).toEqual([
+		"■ session ended · 1.2M tok · 1h04m",
+	]);
+	expect(render(exit, { totals: { tokens: 0, cost: 0, durationMs: null } })).toEqual(["■ session ended"]);
+	expect(render(exit)).toEqual(["■ session ended"]);
+	expect(render(exit, { totals: { tokens: 12, cost: 0, durationMs: 45_000 } })).toEqual(["■ session ended · 12 tok · 45s"]);
+});
+
 test("user messages skip the assignment preamble and cap at 6 lines", () => {
 	const text = [
 		"Complete assignment thoroughly:",
@@ -166,4 +251,5 @@ test("user messages skip the assignment preamble and cap at 6 lines", () => {
 	expect(lines[1]).toBe("  # Target");
 	expect(lines[6]).toBe("  five");
 	expect(lines.join("\n")).not.toContain("six");
+	expect(render(user("# Target"), { color: true })[0]).toBe("\x1b[1mTask:\x1b[0m");
 });

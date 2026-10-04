@@ -125,6 +125,7 @@ function harness(options: FakeHerdrOptions & { maxPanes?: number } = {}): Harnes
 			ratio: 0.6,
 			maxPanes: options.maxPanes ?? 6,
 			closeDelayMs: 1000,
+			failCloseDelayMs: 5000,
 			viewerCommand: (sessionFile, label) => `omp viewer ${sessionFile} --label ${label}`,
 		},
 		(message, context) => logs.push(context === undefined ? { message } : { message, context }),
@@ -205,22 +206,77 @@ test("concurrent opens are serialized: splits happen in order and never overlap"
 	expect(h.pm.size).toBe(3);
 });
 
-test("opens beyond maxPanes make no herdr call and are logged", async () => {
-	const h = harness({ maxPanes: 2, layoutHeights: { "w1:p2": 26 } });
+test("opens beyond maxPanes wait without herdr calls and get the next free slot", async () => {
+	const h = harness({ maxPanes: 2, layoutHeights: { "w1:p2": 26, "w1:p3": 26 } });
 	await h.pm.open(file("A"), "agent A");
 	await h.pm.open(file("B"), "agent B");
 	const before = [...h.herdr.calls];
 	await h.pm.open(file("C"), "agent C");
+	await h.pm.open(file("D"), "agent D");
 	expect(h.herdr.calls).toEqual(before);
 	expect(h.pm.size).toBe(2);
-	expect(h.logs.map((entry) => entry.message)).toEqual(["pane limit reached"]);
-	expect(h.logs[0]?.context?.["key"]).toBe(file("C"));
+	expect(h.logs.map((entry) => entry.context?.["key"])).toEqual([file("C"), file("D")]);
+
+	// A waiting subagent that ends before it got a pane never gets one.
+	h.pm.finish(file("D"), "completed");
+	// With C waiting, A's pane closes without the usual delay and C takes its slot.
+	h.pm.finish(file("A"), "completed");
+	expect(timer(h).ms).toBe(0);
+	timer(h).fire();
+	await settle();
+	expect(callsMatching(h, "close ")).toEqual(["close w1:p2"]);
+	expect(h.herdr.calls).toContain(`run w1:p4 omp viewer ${file("C")} --label agent C`);
+	expect(h.herdr.calls.join("\n")).not.toContain("agent D");
+	expect(h.pm.size).toBe(2);
+});
+
+test("at the limit, an open closes the oldest finished pane instead of waiting", async () => {
+	const h = harness({ maxPanes: 2, layoutHeights: { "w1:p3": 26 } });
+	await h.pm.open(file("A"), "agent A");
+	await h.pm.open(file("B"), "agent B");
+	h.pm.finish(file("B"), "failed");
+	h.pm.finish(file("A"), "completed");
+	await h.pm.open(file("C"), "agent C");
+	// A finished last but is older; its pending close is cancelled, B stays until its own timer.
+	expect(callsMatching(h, "close ")).toEqual(["close w1:p2"]);
+	expect(h.timers.find((t) => t.ms === 1000)?.cancelled).toBe(true);
+	expect(h.herdr.calls).toContain(`run w1:p4 omp viewer ${file("C")} --label agent C`);
+	expect(h.pm.size).toBe(2);
+	expect(h.logs).toEqual([]);
+});
+
+test("finish marks the title with the outcome; failures stay open longer; a revive unmarks", async () => {
+	const h = harness({ layoutHeights: { "w1:p2": 26 } });
+	await h.pm.open(file("A"), "agent A");
+	await h.pm.open(file("B"), "agent B");
+	h.pm.finish(file("A"), "completed");
+	h.pm.finish(file("B"), "aborted");
+	await settle();
+	expect(callsMatching(h, "rename ")).toEqual([
+		"rename w1:p2 agent A",
+		"rename w1:p3 agent B",
+		"rename w1:p2 ✓ agent A",
+		"rename w1:p3 ✗ agent B",
+	]);
+	expect(h.timers.map((t) => t.ms)).toEqual([1000, 5000]);
+
+	await h.pm.open(file("B"), "agent B");
+	expect(callsMatching(h, "rename ").at(-1)).toBe("rename w1:p3 agent B");
+});
+
+test("a finish that arrives before the split titles the new pane with the outcome", async () => {
+	const h = harness({ ticks: 4 });
+	const opening = h.pm.open(file("A"), "agent A");
+	h.pm.finish(file("A"), "failed");
+	await opening;
+	expect(callsMatching(h, "rename ")).toEqual(["rename w1:p2 ✗ agent A"]);
+	expect(timer(h).ms).toBe(5000);
 });
 
 test("finish closes the pane only once the scheduled callback fires", async () => {
 	const h = harness();
 	await h.pm.open(file("A"), "agent A");
-	h.pm.finish(file("A"));
+	h.pm.finish(file("A"), "completed");
 	expect(timer(h).ms).toBe(1000);
 	expect(callsMatching(h, "close ")).toEqual([]);
 	expect(h.pm.size).toBe(1);
@@ -234,7 +290,7 @@ test("finish closes the pane only once the scheduled callback fires", async () =
 test("finish before the split resolves still schedules the close afterwards", async () => {
 	const h = harness({ ticks: 4 });
 	const opening = h.pm.open(file("A"), "agent A");
-	h.pm.finish(file("A"));
+	h.pm.finish(file("A"), "completed");
 	expect(h.timers).toEqual([]); // the pane id is not known yet
 
 	await opening;
@@ -250,7 +306,7 @@ test("finish before the split resolves still schedules the close afterwards", as
 test("a revived subagent cancels the pending close and keeps its pane", async () => {
 	const h = harness();
 	await h.pm.open(file("A"), "agent A");
-	h.pm.finish(file("A"));
+	h.pm.finish(file("A"), "completed");
 	const stale = timer(h);
 
 	await h.pm.open(file("A"), "agent A");
@@ -260,7 +316,7 @@ test("a revived subagent cancels the pending close and keeps its pane", async ()
 	expect(callsMatching(h, "close ")).toEqual([]);
 	expect(h.pm.size).toBe(1);
 
-	h.pm.finish(file("A"));
+	h.pm.finish(file("A"), "completed");
 	timer(h, 1).fire();
 	await settle();
 	expect(callsMatching(h, "close ")).toEqual(["close w1:p2"]);
@@ -284,7 +340,7 @@ test("closeAll closes every pane, cancels pending timers, and closes nothing twi
 	const h = harness({ layoutHeights: { "w1:p2": 26 } });
 	await h.pm.open(file("A"), "agent A");
 	await h.pm.open(file("B"), "agent B");
-	h.pm.finish(file("A"));
+	h.pm.finish(file("A"), "completed");
 	const stale = timer(h);
 
 	await h.pm.closeAll();
